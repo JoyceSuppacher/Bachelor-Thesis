@@ -1,0 +1,149 @@
+---
+title: "00 Packages, Paths, Helper Functions"
+author: "Joyce Suppacher"
+date: "2026-06-14"
+
+
+
+# Setup
+
+This script must be run before all other scripts.
+It loads required packages, defines file paths, color palettes,
+sample order, and the central `loadAlignedBamTable()` function.
+
+---
+
+## 1. Required Packages
+
+```{r packages, message=FALSE, warning=FALSE}
+library(GenomicAlignments)
+library(Rsamtools)
+library(Biostrings)
+library(ShortRead)
+library(ggpubr)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(readODS)
+library(gt)
+library(tibble)
+library(parallel)
+```
+
+---
+
+## 2. File Paths
+# Adjust these paths before running
+
+```{r paths}
+base_dir    <- "/path/"                         
+fastq_dir   <- file.path(base_dir, "path")
+bam_dir     <- file.path(base_dir, "path")
+ref_dir     <- file.path(base_dir, "path")
+ddpcr_file  <- file.path(base_dir, "ods_path")
+output_dir  <- file.path(base_dir, "path")
+blast_dir   <- file.path(base_dir, "path")
+cont_dir    <- file.path(base_dir, "path")
+```
+
+---
+
+## 3. Sample Order and Color Palette
+
+```{r colors}
+# Sample order (consistent across all plots)
+sample_levels <- c("lambda", "wt-fragments", "M1", "M2", "M3", "M4")
+
+# Color palette (consistent across all plots)
+sample_colors <- c(
+  "lambda"       = "#66CDAA",
+  "wt-fragments" = "#DEB887",
+  "M1"           = "#FFB90F",
+  "M2"           = "#FF7F00",
+  "M3"           = "#CD2626",
+  "M4"           = "#8B4500"
+)
+```
+
+---
+
+## 4. Custom ggplot2 Theme
+
+```{r theme}
+theme_publication <- function(base_size = 10) {
+  theme_classic(base_size = base_size) +
+    theme(
+      axis.text    = element_text(color = "black"),
+      axis.title   = element_text(color = "black"),
+      legend.text  = element_text(color = "black"),
+      legend.title = element_text(color = "black")
+    )
+}
+```
+
+---
+
+## 5. Helper Function: loadAlignedBamTable()
+
+Reads a BAM file and returns an S4 object (`AlignedBamTable`) containing:
+- `path`: file path
+- `raw`: GAlignments object
+- `table`: data.frame with per-read metrics (alignment position, length, quality, CIGAR)
+
+```{r load_function}
+# Define S4 class
+setClass(
+  "AlignedBamTable",
+  slots = list(
+    path  = "character",
+    raw   = "GAlignments",
+    table = "data.frame"
+  )
+)
+
+# Load BAM file and compute per-read metrics
+loadAlignedBamTable <- function(file) {
+
+  param    <- ScanBamParam(what = c("qual"))
+  bam      <- readGAlignments(file, param = param)
+  barcode_name <- tools::file_path_sans_ext(basename(file))
+
+  # Compute mean Phred quality score per read (averaged on linear probability scale)
+  qual_list <- mcols(bam)$qual
+  mean_qual <- vapply(qual_list, function(q) {
+    if (is.null(q) || length(q) == 0) return(NA_real_)
+    scores    <- as.integer(q) - 33L       # ASCII → Phred
+    probs     <- 10^(-scores / 10)         # Phred → error probability
+    mean_prob <- mean(probs)               # mean on linear scale
+    -10 * log10(mean_prob)                 # back to Phred
+  }, numeric(1))
+
+  # Build per-read table
+  tbl <- tibble(
+    barcode    = barcode_name,
+    qname      = names(bam),
+    flag       = mcols(bam)$flag,
+    seqnames   = as.character(seqnames(bam)),
+    strand     = as.character(strand(bam)),
+    aln_start  = start(bam),
+    aln_end    = end(bam),
+    aln_length = width(bam),
+    mapq       = mcols(bam)$mapq,
+    cigar      = cigar(bam),
+    read_len   = qwidth(bam),
+    mean_qual  = mean_qual
+  ) |>
+    mutate(strand = ifelse(strand == "+", "1", "-1"))
+
+  new(
+    "AlignedBamTable",
+    path  = file,
+    raw   = bam,
+    table = as.data.frame(tbl)
+  )
+}
+```
+
+---
+

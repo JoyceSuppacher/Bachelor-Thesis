@@ -1,0 +1,267 @@
+---
+title: "02 Quality Control of Nanopore Sequencing Data"
+author: "Joyce Suppacher"
+date: "2026-06-14"
+---
+
+# Quality Control
+
+This script covers:
+1. Conversion of raw Nanopore BAM output to FASTQ
+2. Quality assessment of raw reads (Phred score, read length, read count)
+3. Read classification (mapped/unmapped, primary/multimapped)
+
+Run `00_setup.Rmd` first.
+
+```{r packages, message=FALSE, warning=FALSE}
+library(Biostrings)       # readDNAStringSet(), width()
+library(ShortRead)        # readFastq(), quality()
+library(dplyr)            # mutate(), filter(), bind_rows()
+library(ggpubr)           # gghistogram(), ggviolin()
+library(ggplot2)          # geom_hline(), annotate(), ggsave()
+library(Rsamtools)        # countBam()
+library(gt)               # gt(), tab_header(), cols_label()
+```
+
+Outputs:
+- `PhredScore.svg`: Mean Phred score per read per sample (violin plot)
+- `ReadLength_Distr.svg`: Read length distribution per sample (histogram)
+- Read count table (printed to console)
+
+---
+
+## 1. BAM to FASTQ Conversion
+
+Rebasecalled Nanopore BAM output files are converted to FASTQ format using samtools.
+
+```{bash bam_to_fastq, eval=FALSE}
+# Input:   BAM files from Nanopore rebasecalling
+# Output: FASTQ files per sample
+
+SAMPLES=("lambda" "wt-fragments" "M1" "M2" "M3" "M4")
+RAW_BAM_DIR="/path"
+FASTQ_DIR="/path"
+
+mkdir -p "${FASTQ_DIR}"
+
+for SAMPLE in "${SAMPLES[@]}"; do
+    echo "Converting ${SAMPLE}..."
+    samtools fastq "${RAW_BAM_DIR}/${SAMPLE}.bam" > "${FASTQ_DIR}/${SAMPLE}.fastq"
+done
+```
+
+---
+
+## 2. Load FASTQ Files
+
+```{r load_fastq}
+fastq_files <- list.files(
+  fastq_dir,
+  pattern    = "\\.fastq$|\\.fastq\\.gz$",
+  full.names = TRUE,
+  recursive  = TRUE
+)
+
+# Extract sample names
+sample_names_fq <- basename(fastq_files) %>%
+  gsub("\\.fastq\\.gz$|\\.fastq$", "", .)
+```
+
+---
+
+## 3. Read Count per Sample
+
+```{r read_count}
+read_count_fq <- lapply(seq_along(fastq_files), function(i) {
+  reads <- readDNAStringSet(fastq_files[i], format = "fastq")
+  data.frame(
+    Sample      = sample_names_fq[i],
+    Total_Reads = length(reads)
+  )
+}) %>% bind_rows() %>%
+  mutate(Sample = factor(Sample, levels = sample_levels))
+
+print(read_count_fq)
+```
+
+---
+
+## 4. Read Length Distribution
+
+```{r read_length}
+read_length_fq <- lapply(seq_along(fastq_files), function(i) {
+  reads <- readDNAStringSet(fastq_files[i], format = "fastq")
+  data.frame(
+    Sample      = sample_names_fq[i],
+    read_length = width(reads)
+  )
+}) %>% bind_rows() %>%
+  mutate(Sample = factor(Sample, levels = sample_levels))
+
+gghistogram(
+  data       = read_length_fq,
+  x          = "read_length",
+  fill       = "Sample",
+  color      = "black",
+  bins       = 200,
+  add        = "mean",
+  add.params = list(color = "black", linetype = "dashed", linewidth = 0.25),
+  rug        = FALSE
+) +
+  scale_fill_manual(values = sample_colors) +
+  coord_cartesian(xlim = c(0, 8000)) +
+  facet_wrap(~ Sample, ncol = 3) +
+  labs(
+    title = "Read Length Distribution (FASTQ)",
+    x     = "Read Length (bp)",
+    y     = "Count"
+  ) +
+  theme_pubr() +
+  theme_publication(base_size = 10) +
+  theme(legend.position = "none",
+        axis.text.x = element_text(angle = 45, hjust = 1))
+
+ggsave(file.path(output_dir, "ReadLength_Distr.svg"),
+       width = 180, height = 120, units = "mm")
+```
+
+---
+
+## 5. Phred Score Distribution
+
+Mean Phred quality score per read, averaged on linear error probability scale.
+
+```{r phred_score}
+qscore_df <- lapply(seq_along(fastq_files), function(i) {
+  reads     <- readFastq(fastq_files[i])
+  qual_list <- as.character(quality(quality(reads)))
+
+  mean_qual <- vapply(qual_list, function(q) {
+    if (is.null(q) || length(q) == 0) return(NA_real_)
+    scores    <- utf8ToInt(q) - 33L
+    probs     <- 10^(-scores / 10)
+    mean_prob <- mean(probs)
+    -10 * log10(mean_prob)
+  }, numeric(1))
+
+  data.frame(Sample = sample_names_fq[i], mean_qual = mean_qual)
+}) %>% bind_rows() %>%
+  mutate(Sample = factor(Sample, levels = sample_levels))
+
+ggviolin(
+  data       = qscore_df,
+  x          = "Sample",
+  y          = "mean_qual",
+  fill       = "Sample",
+  alpha      = 0.8,
+  add        = "boxplot",
+  add.params = list(width = 0.1, fill = "white")
+) +
+  scale_fill_manual(values = sample_colors) +
+  geom_hline(yintercept = 20, linetype = "dashed", color = "red", linewidth = 0.6) +
+  labs(
+    title = "Phred Score per Sample",
+    y     = "Phred Score per Read (Q)",
+    x     = "Sample"
+  ) +
+  theme_pubr() +
+  theme_publication(base_size = 10) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "right")
+
+ggsave(file.path(output_dir, "PhredScore.svg"),
+       width = 180, height = 120, units = "mm")
+```
+
+---
+
+## 6. Read Classification
+
+This section documents the classification of reads into mapped/unmapped
+and primary/multimapped categories.
+
+Note on reported units:
+- Unmapped, Mapped and Primary Aligned are reported as unique reads
+- Multimapped is reported as alignments (secondary + supplementary combined),
+  as one read can produce multiple supplementary alignments
+
+### 6.1 Create Classification BAM Files
+
+
+```{bash create_classification_bam, eval=FALSE}
+SAMPLES=("lambda" "wt-fragments" "M1" "M2" "M3" "M4")
+ALN_DIR="/path"
+OUT_DIR="/path"
+
+mkdir -p "${OUT_DIR}"
+
+for SAMPLE in "${SAMPLES[@]}"; do
+    BAM="${ALN_DIR}/sorted_alignment_${SAMPLE}.bam"
+
+    # Unmapped reads (flag 4 set)
+    samtools view -f 4 -b -h "${BAM}" > "${OUT_DIR}/unmapped_${SAMPLE}.bam"
+
+    # Mapped reads (flag 4 not set)
+    samtools view -F 4 -b -h "${BAM}" > "${OUT_DIR}/mapped_${SAMPLE}.bam"
+
+    # Primary alignments (unique mappers)
+    samtools view -F 2308 -b -h "${BAM}" > "${OUT_DIR}/primary_${SAMPLE}.bam"
+
+    # Secondary alignments (flag 256 set)
+    samtools view -f 256 -b -h "${BAM}" > "${OUT_DIR}/secondary_${SAMPLE}.bam"
+
+    # Supplementary alignments (flag 2048 set)
+    samtools view -f 2048 -b -h "${BAM}" > "${OUT_DIR}/supplementary_${SAMPLE}.bam"
+
+    # Index all
+    for TYPE in unmapped mapped primary secondary supplementary; do
+        samtools index "${OUT_DIR}/${TYPE}_${SAMPLE}.bam"
+    done
+done
+```
+
+### 6.2 Extract Read and Alignment Counts
+
+Unmapped, Mapped and Primary Aligned are counted as unique Reads via
+Read name deduplication (`sort -u`). Secondary and Supplementary are
+counted as Alignments via `samtools view -c`.
+
+
+```{bash count_classification, eval=FALSE}
+OUT_DIR="/path"
+
+echo "Sample,Unmapped_Reads,Mapped_Reads,Primary_Reads,Secondary_Aln,Supplementary_Aln" \
+    > "${OUT_DIR}/read_classification.csv"
+
+for SAMPLE in lambda wt-fragments M1 M2 M3 M4; do
+
+    # Unmapped Reads (unique Read names)
+    UNMAPPED=$(samtools view "${OUT_DIR}/unmapped_${SAMPLE}.bam" \
+        | cut -f1 | sort -u | wc -l)
+
+    # Mapped Reads (unique Read names)
+    MAPPED=$(samtools view "${OUT_DIR}/mapped_${SAMPLE}.bam" \
+        | cut -f1 | sort -u | wc -l)
+
+    # Primary Aligned Reads (alignment count = read count for primary)
+    PRIMARY=$(samtools view -c "${OUT_DIR}/primary_${SAMPLE}.bam")
+
+    # Secondary Alignments (alignment count)
+    SECONDARY=$(samtools view -c "${OUT_DIR}/secondary_${SAMPLE}.bam")
+
+    # Supplementary Alignments (alignment count)
+    SUPPLEMENTARY=$(samtools view -c "${OUT_DIR}/supplementary_${SAMPLE}.bam")
+
+    echo "${SAMPLE},${UNMAPPED},${MAPPED},${PRIMARY},${SECONDARY},${SUPPLEMENTARY}" \
+        >> "${OUT_DIR}/read_classification.csv"
+
+done
+```
+
+### 6.3 Build Classification Table
+
+Values were extracted via bash and compiled into a table via Excel.
+Multimapped = Secondary + Supplementary Alignments.
+
+---
+

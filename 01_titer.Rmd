@@ -1,0 +1,79 @@
+---
+title: "01 Titer Determination (ddPCR)"
+author: "Joyce Suppacher"
+date: "`2026-06-14"
+
+---
+
+# Titer Determination
+
+This script visualizes vector titers determined by droplet digital PCR (ddPCR).
+Titer values were pre-calculated from QuantaSoft output using:
+(CopiesPer20µLWell / 5) × 1000 × dilution factor = vg/mL
+
+Run `00_setup.Rmd` first.
+
+```{r packages, message=FALSE, warning=FALSE}
+library(readODS)   # read_ods(): load ddPCR data from ODS file
+library(dplyr)     # mutate(), factor()
+library(ggpubr)    # ggboxplot(), stat_compare_means()
+library(ggplot2)   # scale_fill_manual(), ggsave()
+```
+
+Output:
+- `Titer.svg`: Boxplot of vector titers per sample with statistical comparisons
+
+---
+
+## 1. Load ddPCR Data
+
+```{r load_titer}
+titer_df <- read_ods(ddpcr_file, sheet = 3)
+
+# Ensure correct column name and sample order
+colnames(titer_df)[2] <- "vg per mL"
+titer_df <- titer_df %>%
+  mutate(Sample = factor(Sample, levels = sample_levels))
+```
+
+---
+
+## 2. Titer Boxplot
+
+Statistical comparison: Wilcoxon rank-sum test, Lambda as reference group.
+Non-significant comparisons are not shown (hide.ns = TRUE).
+
+```{r titer_plot}
+ggboxplot(
+  data       = titer_df,
+  x          = "Sample",
+  y          = "vg per mL",
+  fill       = "Sample",
+  color      = "black",
+  add        = "jitter",
+  add.params = list(color = "black", size = 0.5, alpha = 1)
+) +
+  scale_fill_manual(values = sample_colors) +
+  scale_y_continuous(expand = expansion(mult = c(0.05, 0.1))) +
+  stat_compare_means(
+    comparisons = list(
+      c("lambda", "wt-fragments"),
+      c("lambda", "M1"),
+      c("lambda", "M2"),
+      c("lambda", "M3"),
+      c("lambda", "M4")
+    ),
+    method   = "wilcox.test",
+    label    = "p.signif",
+    hide.ns  = TRUE
+  ) +
+  theme_publication(base_size = 10) +
+  theme(legend.position = "right",
+        axis.text.x = element_text(angle = 45, hjust = 1))
+
+ggsave(file.path(output_dir, "Titer.svg"),
+       width = 90, height = 80, units = "mm")
+```
+
+---
+

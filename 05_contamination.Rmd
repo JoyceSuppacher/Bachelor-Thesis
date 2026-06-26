@@ -1,0 +1,287 @@
+---
+title: "05 Contamination Analysis"
+author: "Joyce Suppacher"
+date: "2026-06-14"
+---
+
+# Contamination Analysis
+
+This script covers:
+1. Alignment to cap/rep reference sequences (PAF files)
+2. Extraction of contaminating read names (R)
+3. Subsetting FASTQ to contaminating reads (seqtk)
+4. Re-alignment to virus reference (BAM)
+5. Metagenome construction and alignment
+6. Contamination plot
+
+Run `00_setup.Rmd` first.
+
+```{r packages, message=FALSE, warning=FALSE}
+library(Rsamtools)         # countBam()
+library(dplyr)             # mutate(), filter(), distinct(), bind_rows(), left_join()
+library(readr)             # read_tsv()
+library(ggpubr)            # ggbarplot()
+library(ggplot2)           # scale_y_continuous(), ggsave()
+library(gt)                # gt(), tab_header(), cols_label()
+```
+
+Output:
+- `contamination_percent.svg`
+
+---
+
+## 1. Align to cap/rep Reference Sequences
+
+FASTQ files are aligned to individual cap/rep reference sequences
+to identify reads containing contaminating sequences.
+
+
+```{bash paf_alignment, eval=FALSE}
+# Input:  FASTQ files per sample, FASTA per contaminant (VP1, VP3, Rep78)
+# Output: PAF files per sample/contaminant combination
+
+SAMPLES=("lambda" "wt-fragments" "M1" "M2" "M3" "M4")
+CONTAMINANTS=("VP1" "VP3" "rep78")
+FASTQ_DIR="/path"
+REF_DIR="/path"
+CONT_DIR="/path"
+
+mkdir -p "${CONT_DIR}"
+
+for SAMPLE in "${SAMPLES[@]}"; do
+    for CONT in "${CONTAMINANTS[@]}"; do
+        minimap2 -x map-ont \
+            "${REF_DIR}/AAV_${CONT}.fasta" \
+            "${FASTQ_DIR}/${SAMPLE}.fastq" \
+            > "${CONT_DIR}/${CONT}_${SAMPLE}.paf"
+    done
+done
+```
+
+---
+
+## 2. Extract Contaminating Read Names
+
+Read names of full-length alignments are extracted from PAF files in R
+and saved as TXT files for use with seqtk.
+
+```{r extract_readnames}
+# Example for VP1 (repeat analogously for VP3 and Rep78)
+paf_dir  <- file.path(cont_dir, "contamination_reads")
+cont_dir_reads <- file.path(cont_dir, "contamination_reads")
+
+extract_readnames <- function(paf_file, min_length = 1000) {
+  paf <- read_tsv(paf_file,
+    col_names = c("qname", "qlen", "qstart", "qend", "strand",
+                  "tname", "tlen", "tstart", "tend", "matches",
+                  "aln_len", "mapq"),
+    col_types = cols(.default = "c")
+  ) %>%
+    mutate(aln_len = as.numeric(aln_len)) %>%
+    filter(aln_len >= min_length)
+  unique(paf$qname)
+}
+
+for (sample in sample_levels) {
+  for (cont in c("VP1", "VP3", "rep78")) {
+    paf_file <- file.path(cont_dir_reads, paste0(cont, "_", sample, ".paf"))
+    if (file.exists(paf_file)) {
+      readnames <- extract_readnames(paf_file)
+      out_file  <- file.path(cont_dir_reads,
+                             paste0("readnames_", cont, "_", sample, ".txt"))
+      writeLines(readnames, out_file)
+      cat(sample, cont, "–", length(readnames), "reads\n")
+    }
+  }
+}
+```
+
+---
+
+## 3. Subset FASTQ to Contaminating Reads
+
+Contaminating reads are extracted from FASTQ files using seqtk.
+Note: eval=FALSE – run on HPC.
+
+```{bash seqtk_subset, eval=FALSE}
+# Input:  FASTQ files, TXT files with read names
+# Output: FASTQ files containing only contaminating reads
+
+SAMPLES=("lambda" "wt-fragments" "M1" "M2" "M3" "M4")
+CONTAMINANTS=("VP1" "VP3" "rep78")
+FASTQ_DIR="/your/path/data/02_fastq/A_tailing"
+CONT_DIR="/your/path/data/08_contaminations/contamination_reads"
+
+for SAMPLE in "${SAMPLES[@]}"; do
+    for CONT in "${CONTAMINANTS[@]}"; do
+        READNAMES="${CONT_DIR}/readnames_${CONT}_${SAMPLE}.txt"
+        if [ -f "${READNAMES}" ]; then
+            seqtk subseq \
+                "${FASTQ_DIR}/${SAMPLE}.fastq" \
+                "${READNAMES}" \
+                > "${CONT_DIR}/${CONT}_${SAMPLE}.fastq"
+        fi
+    done
+done
+```
+
+---
+
+## 4. Re-align Contaminating Reads to Virus Reference
+
+```{bash realignment, eval=FALSE}
+# Input:  FASTQ files with contaminating reads
+# Output: Sorted, indexed BAM files
+
+SAMPLES=("lambda" "wt-fragments" "M1" "M2" "M3" "M4")
+CONTAMINANTS=("VP1" "VP3" "rep78")
+CONT_DIR="/path"
+VIRUS_REF="/path"
+
+mkdir -p "${CONT_DIR}/contamination_alignments"
+
+for SAMPLE in "${SAMPLES[@]}"; do
+    for CONT in "${CONTAMINANTS[@]}"; do
+        FASTQ="${CONT_DIR}/contamination_reads/${CONT}_${SAMPLE}.fastq"
+        BAM_OUT="${CONT_DIR}/contamination_alignments/${CONT}_${SAMPLE}.sorted.bam"
+        if [ -f "${FASTQ}" ]; then
+            minimap2 -ax map-ont "${VIRUS_REF}" "${FASTQ}" \
+                | samtools view -bS \
+                | samtools sort -o "${BAM_OUT}"
+            samtools index "${BAM_OUT}"
+        fi
+    done
+done
+```
+
+---
+
+## 5. Build Metagenome and Align
+
+The metagenome combines all contamination reference sequences:
+generic backbone, AdH sequences, cap/rep-specific sequences (WHc2), and hg38.
+
+
+```{bash metagenome, eval=FALSE}
+# Build metagenome
+CONT_REF_DIR="/path"
+METAGENOME="/path"
+
+mkdir -p "$(dirname ${METAGENOME})"
+cat "${CONT_REF_DIR}"/*.fasta > "${METAGENOME}"
+
+# Align each sample to metagenome
+SAMPLES=("lambda" "wt-fragments" "M1" "M2" "M3" "M4")
+FASTQ_DIR="/path"
+GB_DIR="/path"
+
+mkdir -p "${GB_DIR}"
+
+for SAMPLE in "${SAMPLES[@]}"; do
+    minimap2 -ax map-ont "${METAGENOME}" "${FASTQ_DIR}/${SAMPLE}.fastq" \
+        | samtools view -bS \
+        | samtools sort -o "${GB_DIR}/${SAMPLE}_gb.sorted.bam"
+    samtools index "${GB_DIR}/${SAMPLE}_gb.sorted.bam"
+done
+```
+
+---
+
+## 6. Load and Process Contamination Data
+
+```{r load_cont}
+load_cont <- function(sample_name, file_suffix) {
+  file <- file.path(cont_dir, "generic_backbone",
+                    paste0(file_suffix, ".sorted.bam"))
+  obj  <- loadAlignedBamTable(file)
+  obj@table %>%
+    filter(mapq >= 50) %>%
+    mutate(
+      seqnames_grouped = case_when(
+        grepl("backbone|AdH|WHc2", seqnames) ~ seqnames,
+        TRUE ~ "Human Genome"
+      )
+    ) %>%
+    distinct(qname, seqnames_grouped) %>%
+    dplyr::count(seqnames_grouped, sort = TRUE)
+}
+
+cont_gb_lambda <- load_cont("lambda",       "lambda_gb")
+cont_gb_wtf    <- load_cont("wt-fragments", "wt-fragment_gb")
+cont_gb_M1     <- load_cont("M1",           "M1_gb")
+cont_gb_M2     <- load_cont("M2",           "M2_gb")
+cont_gb_M3     <- load_cont("M3",           "M3_gb")
+cont_gb_M4     <- load_cont("M4",           "M4_gb")
+```
+
+---
+
+## 7. Calculate Total Reads and Percentages
+
+```{r total_reads}
+fastq_files <- list.files(
+  fastq_dir,
+  pattern    = "\\.fastq$|\\.fastq\\.gz$",
+  full.names = TRUE
+)
+
+total_reads <- data.frame(
+  Sample = basename(fastq_files) %>%
+             gsub("\\.fastq\\.gz$|\\.fastq$", "", .),
+  total  = sapply(fastq_files, function(f) {
+    length(readDNAStringSet(f, format = "fastq"))
+  })
+)
+
+cont_all <- bind_rows(
+  cont_gb_lambda %>% mutate(Sample = "lambda"),
+  cont_gb_wtf    %>% mutate(Sample = "wt-fragments"),
+  cont_gb_M1     %>% mutate(Sample = "M1"),
+  cont_gb_M2     %>% mutate(Sample = "M2"),
+  cont_gb_M3     %>% mutate(Sample = "M3"),
+  cont_gb_M4     %>% mutate(Sample = "M4")
+) %>%
+  left_join(total_reads, by = "Sample") %>%
+  mutate(
+    percent          = round(n / total * 100, 6),
+    Sample           = factor(Sample, levels = sample_levels),
+    seqnames_grouped = factor(seqnames_grouped,
+                              levels = c("backbone", "AdH", "cap/rep", "Human Genome"))
+  )
+```
+
+---
+
+## 8. Contamination Plot
+
+```{r cont_plot}
+ggbarplot(
+  data    = cont_all,
+  x       = "Sample",
+  y       = "percent",
+  fill    = "seqnames_grouped",
+  color   = "transparent",
+  palette = c(
+    "backbone"     = "#4CAF50",
+    "AdH"          = "#F44336",
+    "cap/rep"      = "#FF9800",
+    "Human Genome" = "#2196F3"
+  )
+) +
+  scale_y_continuous(labels = function(x) paste0(x, "%")) +
+  labs(
+    title = "Contamination per Sample",
+    x     = "Sample",
+    y     = "% of Total Reads",
+    fill  = "Category"
+  ) +
+  theme_publication(base_size = 10) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "right")
+
+ggsave(file.path(output_dir, "contamination_percent.svg"),
+       width = 90, height = 60, units = "mm")
+```
+
+---
+

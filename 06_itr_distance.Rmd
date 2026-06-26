@@ -1,0 +1,185 @@
+---
+title: "06 ITR Distance Analysis"
+author: "Joyce Suppacher"
+date: "2026-06-14"
+---
+
+# ITR Distance Analysis
+
+This script covers:
+1. Conversion of contaminating FASTQ to FASTA
+2. BLAST of ITR sequences against contaminating reads
+3. Classification of reads as "correctly spaced" (ITR-to-ITR distance >= 2000 bp)
+
+Threshold of 2000 bp reflects minimum expected length of ITR-flanked read
+containing the shortest contaminant (Rep78, ~1900 bp + 2x ITR ~130 bp).
+
+Run `00_setup.Rmd` and `05_contamination.Rmd` first.
+
+```{r packages, message=FALSE, warning=FALSE}
+library(readr)    # read_tsv(): load BLAST output files
+library(dplyr)    # mutate(), group_by(), summarise(), bind_rows(), left_join()
+library(purrr)    # map_dfr(): load multiple BLAST files
+library(gt)       # gt(), tab_header(), cols_label(), tab_style()
+```
+
+Output:
+- ITR distance summary table (gt)
+
+---
+
+## 1. Convert Contaminating FASTQ to FASTA
+
+Required for BLAST input format.
+Note: eval=FALSE – run on HPC.
+
+```{bash fastq_to_fasta, eval=FALSE}
+# Input:  FASTQ files with contaminating reads (from 04_contamination.Rmd Step 3)
+# Output: FASTA files per sample/contaminant
+
+SAMPLES=("lambda" "wt-fragments" "M1" "M2" "M3" "M4")
+CONTAMINANTS=("VP1" "VP3" "rep78")
+CONT_DIR="/path"
+BLAST_DIR="/path"
+
+mkdir -p "${BLAST_DIR}/VP1" "${BLAST_DIR}/VP3" "${BLAST_DIR}/rep78"
+
+for SAMPLE in "${SAMPLES[@]}"; do
+    for CONT in "${CONTAMINANTS[@]}"; do
+        FASTQ="${CONT_DIR}/${CONT}_${SAMPLE}.fastq"
+        FASTA="${BLAST_DIR}/${CONT}/${CONT}_${SAMPLE}.fasta"
+        if [ -f "${FASTQ}" ]; then
+            seqtk seq -A "${FASTQ}" > "${FASTA}"
+        fi
+    done
+done
+```
+
+---
+
+## 2. BLAST ITR Sequences Against Contaminating Reads
+
+Both AAV2 ITRs (ITR1 and ITR2) are used as queries.
+
+
+```{bash blast, eval=FALSE}
+# Input:  ITR FASTA (query), contaminating read FASTA (subject)
+# Output: TSV files with BLAST hits
+
+ITR_FASTA="/path"
+BLAST_DIR="/path"
+
+for SAMPLE in "${SAMPLES[@]}"; do
+    for CONT in "${CONTAMINANTS[@]}"; do
+        FASTA="${BLAST_DIR}/${CONT}/${CONT}_${SAMPLE}.fasta"
+        TSV_OUT="${BLAST_DIR}/${CONT}/ITR_${CONT}_${SAMPLE}.tsv"
+        if [ -f "${FASTA}" ]; then
+            blastn \
+                -query   "${ITR_FASTA}" \
+                -subject "${FASTA}" \
+                -out     "${TSV_OUT}" \
+                -outfmt  "6 qseqid sseqid pident length mismatch gapopen qstart qend sstart send evalue bitscore"
+        fi
+    done
+done
+```
+
+---
+
+## 3. Load BLAST Results
+
+```{r load_blast}
+samples_vp1 <- c("M1", "M2", "M4")
+
+all_vp1 <- map_dfr(samples_vp1, ~ {
+  read_tsv(
+    file.path(blast_dir, "VP1", paste0("ITR_VP1_", .x, ".tsv")),
+    col_names = c("qseqid", "sseqid", "pident", "length", "mismatch",
+                  "gapopen", "qstart", "qend", "sstart", "send",
+                  "evalue", "bitscore")
+  ) %>%
+    filter(length >= 130) %>%
+    mutate(
+      contaminants = "VP1",
+      Sample       = .x,
+      itr_type     = case_when(
+        qseqid == "AAV2_ITR1" ~ "ITR1",
+        qseqid == "AAV2_ITR2" ~ "ITR2",
+        TRUE ~ qseqid
+      ),
+      group = paste0(Sample, "_", itr_type)
+    )
+})
+
+# Load VP3 and Rep78 analogously
+# all_vp3      <- map_dfr(samples_vp3, ~ { ... })
+# itr_data_rep <- map_dfr(samples_rep, ~ { ... })
+```
+
+---
+
+## 4. Classify Reads as Correctly Spaced
+
+Reads with ITR-to-ITR distance >= 2000 bp are classified as
+"correctly spaced".
+
+```{r classify}
+all_data <- bind_rows(
+  itr_data_rep,
+  all_vp1,
+  all_vp3
+) %>%
+  mutate(pos = pmin(sstart, send))
+
+result <- all_data %>%
+  group_by(contaminants, Sample, sseqid) %>%
+  summarise(
+    n_hits  = n(),
+    max_pos = max(pos),
+    min_pos = min(pos),
+    distant = if (n_hits < 2) {
+      FALSE
+    } else {
+      (max_pos - min_pos) >= 2000
+    },
+    .groups = "drop"
+  )
+```
+
+---
+
+## 5. Summarise and Display Results
+
+```{r summarise}
+summary_itr <- result %>%
+  group_by(contaminants, Sample) %>%
+  summarise(
+    total_reads   = n(),
+    distant_reads = sum(distant),
+    percent       = 100 * distant_reads / total_reads,
+    .groups       = "drop"
+  )
+
+final <- summary_itr %>%
+  left_join(read_stats, by = "Sample") %>%
+  mutate(percent_of_library = distant_reads / Raw * 100) %>%
+  select(-Mapped, -Unmapped, -Filtered, -Raw,
+         -Mapped_pct, -Unmapped_pct, -Filtered_pct, -percent)
+
+final %>%
+  gt() %>%
+  tab_header(title = "ITR Distance") %>%
+  cols_label(
+    contaminants       = "Contaminant",
+    Sample             = "Sample",
+    total_reads        = "ITR-containing reads",
+    distant_reads      = "Correctly spaced ITR reads",
+    percent_of_library = "% of Library"
+  ) %>%
+  cols_align(align = "center", columns = everything()) %>%
+  tab_style(style = cell_text(color = "black"), locations = cells_body()) %>%
+  tab_style(style = cell_text(color = "black"), locations = cells_column_labels()) %>%
+  tab_style(style = cell_text(color = "black"), locations = cells_title())
+```
+
+---

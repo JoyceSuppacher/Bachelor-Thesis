@@ -1,0 +1,349 @@
+---
+title: "03 Truncation Analysis"
+author: "Joyce Suppacher"
+date: "2026-06-14"
+---
+
+# Truncation Analysis
+
+This script covers:
+1. Alignment of FASTQ files to transgene references
+2. Sorting, indexing and filtering of BAM files
+3. Truncation analysis (alignment length, match count, genome integrity, coverage)
+
+Run `00_setup.Rmd` first.
+
+```{r packages, message=FALSE, warning=FALSE}
+library(GenomicAlignments) # readGAlignments(), cigar(), start(), end(), width()
+library(dplyr)             # mutate(), filter(), bind_rows(), group_by(), summarise()
+library(tidyr)             # pivot_longer()
+library(ggpubr)            # gghistogram(), ggscatter(), ggbarplot()
+library(ggplot2)           # geom_histogram(), geom_hline(), ggsave()
+library(purrr)             # map_dfr()
+```
+
+Outputs:
+- `Filtered_AlnLength_Distr.svg`
+- `Matches.svg`
+- `Scatterplot_Aln.png`
+- `Histogram_Aln_Start_End.svg`
+- `Count_comparison_matches.svg`
+- `Startpoints2000bp.svg`
+
+---
+
+## 1. Alignment to Transgene References
+
+FASTQ files are aligned to the respective transgene reference sequence
+using minimap2.
+
+
+```{bash alignment, eval=FALSE}
+# Input:  FASTQ files per sample, reference FASTA per transgene variant
+# Output: Sorted, indexed BAM files
+
+SAMPLES=("lambda" "wt-fragments" "M1" "M2" "M3" "M4")
+FASTQ_DIR="/path"
+REF_DIR="/path"
+ALN_DIR="/path"
+
+mkdir -p "${ALN_DIR}"
+
+for SAMPLE in "${SAMPLES[@]}"; do
+    minimap2 -ax map-ont \
+        "${REF_DIR}/transgene_cassette_${SAMPLE}.fasta" \
+        "${FASTQ_DIR}/${SAMPLE}.fastq" \
+        | samtools view -bS \
+        | samtools sort -o "${ALN_DIR}/sorted_alignment_${SAMPLE}.bam"
+
+    samtools index "${ALN_DIR}/sorted_alignment_${SAMPLE}.bam"
+done
+```
+
+---
+
+## 2. Filter BAM Files
+
+Secondary (flag 256), supplementary (flag 2048) and unmapped (flag 4)
+alignments are removed. Combined flag: -F 2308.
+
+
+```{bash filter, eval=FALSE}
+# Input:  Sorted BAM files
+# Output: Filtered BAM files (primary alignments only)
+
+ALN_DIR="/path"
+FILTERED_DIR="/path"
+
+mkdir -p "${FILTERED_DIR}"
+
+for SAMPLE in "${SAMPLES[@]}"; do
+    samtools view -F 2308 -b -h \
+        "${ALN_DIR}/sorted_alignment_${SAMPLE}.bam" \
+        > "${FILTERED_DIR}/filtered_supp_unm_sec_${SAMPLE}.bam"
+
+    samtools index "${FILTERED_DIR}/filtered_supp_unm_sec_${SAMPLE}.bam"
+done
+```
+
+---
+
+## 3. Load Filtered BAM Files
+
+```{r load_bam}
+filtered_files <- list.files(
+  bam_dir,
+  pattern    = "\\.bam$",
+  full.names = TRUE,
+  recursive  = TRUE
+)
+
+sample_names_f <- basename(filtered_files) %>%
+  gsub("filtered_supp_unm_sec_", "", .) %>%
+  gsub("\\.bam$", "", .)
+
+# Load all BAM files into AlignedBamTable objects
+filtered_objects <- lapply(filtered_files, loadAlignedBamTable)
+names(filtered_objects) <- sample_names_f
+
+# Combine into single data frame
+aln_df <- lapply(filtered_objects, function(obj) obj@table) %>%
+  bind_rows() %>%
+  mutate(
+    barcode       = gsub("filtered_supp_unm_sec_", "", barcode) %>%
+                    gsub("sorted_alignment_", "", .),
+    barcode       = factor(barcode, levels = sample_levels),
+    strand_label  = ifelse(strand == "1", "+", "-"),
+    aln_start_new = ifelse(strand == "1", aln_start, aln_end),
+    aln_end_new   = ifelse(strand == "1", aln_end,   aln_start)
+  )
+```
+
+---
+
+## 4. Alignment Length Distribution
+
+```{r aln_length}
+aln_length_df <- aln_df %>% select(Sample = barcode, aln_length)
+
+gghistogram(
+  data       = aln_length_df,
+  x          = "aln_length",
+  fill       = "Sample",
+  color      = "black",
+  bins       = 20,
+  add        = "mean",
+  add.params = list(color = "black", linetype = "dashed", linewidth = 0.25),
+  rug        = FALSE
+) +
+  scale_fill_manual(values = sample_colors) +
+  scale_y_continuous(labels = function(x) format(x, scientific = FALSE)) +
+  coord_cartesian(xlim = c(0, 8000)) +
+  facet_wrap(~ Sample, ncol = 3) +
+  labs(title = "Alignment Length Distribution per Sample",
+       x = "Alignment Length (bp)", y = "Count") +
+  theme_publication(base_size = 10) +
+  theme(legend.position = "none",
+        axis.text.x = element_text(angle = 45, hjust = 1))
+
+ggsave(file.path(output_dir, "Filtered_AlnLength_Distr.svg"),
+       width = 180, height = 120, units = "mm")
+```
+
+---
+
+## 5. Match Count Distribution
+
+```{r match_count}
+match_df <- lapply(seq_along(filtered_files), function(i) {
+  reads <- readGAlignments(filtered_files[i])
+  cig   <- cigar(reads)
+  match_counts <- sapply(cig, function(c) {
+    lengths <- as.numeric(unlist(regmatches(c, gregexpr("[0-9]+", c))))
+    ops     <- unlist(regmatches(c, gregexpr("[A-Z]", c)))
+    sum(lengths[ops == "M"])
+  })
+  data.frame(Sample = sample_names_f[i], matches = match_counts)
+}) %>% bind_rows() %>%
+  mutate(Sample = factor(Sample, levels = sample_levels))
+
+gghistogram(
+  data  = match_df,
+  x     = "matches",
+  fill  = "Sample",
+  color = "transparent",
+  bins  = 50,
+  alpha = 1
+) +
+  scale_fill_manual(values = sample_colors) +
+  scale_y_continuous(
+    limits = c(0, 125000),
+    breaks = seq(0, 100000, by = 50000),
+    labels = function(x) format(x, scientific = FALSE)
+  ) +
+  coord_cartesian(xlim = c(0, 8000)) +
+  facet_wrap(~ Sample, ncol = 3) +
+  labs(title = "Match Distribution per Sample",
+       x = "Number of Matches (M)", y = "Count") +
+  theme_publication(base_size = 10) +
+  theme(legend.position = "none",
+        axis.text.x = element_text(angle = 45, hjust = 1))
+
+ggsave(file.path(output_dir, "Matches.svg"),
+       width = 180, height = 120, units = "mm")
+```
+
+---
+
+## 6. Alignment Start vs. End Scatterplot
+
+```{r scatterplot}
+ggscatter(
+  data    = aln_df,
+  x       = "aln_start_new",
+  y       = "aln_end_new",
+  color   = "strand_label",
+  palette = c("+" = "#F44336", "-" = "#2196F3"),
+  size    = 0.1,
+  alpha   = 0.3
+) +
+  scale_x_continuous(
+    breaks = seq(0, max(aln_df$aln_start_new, na.rm = TRUE), by = 2000)
+  ) +
+  facet_wrap(~ barcode, ncol = 3) +
+  labs(x = "Alignment Start", y = "Alignment End", color = "Strand") +
+  theme_publication(base_size = 10) +
+  theme(legend.position = "right",
+        axis.text.x = element_text(angle = 45, hjust = 1))
+
+ggsave(file.path(output_dir, "Scatterplot_Aln.png"),
+       width = 180, height = 120, units = "mm", dpi = 600)
+```
+
+---
+
+## 7. Histogram of Alignment Start and End Positions
+
+```{r aln_histogram}
+aln_df_div <- aln_df %>%
+  mutate(
+    aln_start_new = ifelse(strand == "-1", aln_end,   aln_start),
+    aln_end_new   = ifelse(strand == "-1", aln_start, aln_end)
+  )
+
+df_long <- aln_df_div %>%
+  pivot_longer(
+    cols      = c(aln_start_new, aln_end_new),
+    names_to  = "variable",
+    values_to = "coordinate"
+  )
+
+ggplot(df_long, aes(x = coordinate, fill = variable)) +
+  geom_histogram(
+    data     = df_long %>% filter(strand == "1"),
+    alpha    = 1, bins = 50, position = "identity"
+  ) +
+  geom_histogram(
+    data     = df_long %>% filter(strand == "-1"),
+    aes(y    = -after_stat(count)),
+    alpha    = 1, bins = 50, position = "identity"
+  ) +
+  scale_y_continuous(labels = function(x) format(x, scientific = FALSE)) +
+  scale_fill_manual(
+    values = c("aln_start_new" = "black", "aln_end_new" = "#CD6600"),
+    labels = c("aln_start_new" = "Aln Start", "aln_end_new" = "Aln End")
+  ) +
+  geom_hline(yintercept = 0) +
+  facet_wrap(~ barcode, ncol = 3) +
+  labs(x = "Position [bp]", y = "Count", fill = "Variable") +
+  theme_publication(base_size = 10) +
+  theme(legend.position = "right",
+        axis.text.x = element_text(angle = 45, hjust = 1))
+
+ggsave(file.path(output_dir, "Histogram_Aln_Start_End.svg"),
+       width = 180, height = 120, units = "mm")
+```
+
+---
+
+## 8. Genome Integrity (Complete vs. Truncated)
+
+```{r genome_integrity}
+genome_length <- 4700
+
+match_df <- match_df %>%
+  mutate(
+    genome_type = case_when(
+      matches >= genome_length * 0.95 &
+        matches <= genome_length * 1.05 ~ "Complete (±5%)",
+      TRUE ~ "Truncated"
+    )
+  )
+
+genome_stats <- match_df %>%
+  group_by(Sample, genome_type) %>%
+  summarise(count = n(), .groups = "drop") %>%
+  group_by(Sample) %>%
+  mutate(
+    percent     = round(count / sum(count) * 100, 1),
+    genome_type = factor(genome_type, levels = c("Complete (±5%)", "Truncated"))
+  )
+
+ggbarplot(
+  data          = genome_stats,
+  x             = "Sample",
+  y             = "percent",
+  fill          = "genome_type",
+  color         = "transparent",
+  palette       = c("Complete (±5%)" = "#8FBC8F", "Truncated" = "#FF7256"),
+  label         = TRUE,
+  lab.nb.digits = 1,
+  lab.size      = 3,
+  lab.vjust     = 0.5
+) +
+  scale_y_continuous(
+    labels = function(x) paste0(x, "%"),
+    expand = expansion(mult = c(0.05, 0.1))
+  ) +
+  labs(x = "Sample", y = "Percentage of Reads (%)", fill = "Genome Type") +
+  theme_publication(base_size = 12) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "right")
+
+ggsave(file.path(output_dir, "Count_comparison_matches.svg"),
+       width = 180, height = 120, units = "mm")
+```
+
+---
+
+## 9. Detail View: Alignment Start Positions at ~2000 bp
+
+```{r starts_2000bp}
+reads_2000 <- aln_df %>%
+  filter(aln_start >= 1800 & aln_start <= 2200)
+
+cat("Number of reads with start position at ~2000 bp:", nrow(reads_2000), "\n")
+summary(reads_2000$read_len)
+summary(reads_2000$aln_length)
+table(reads_2000$strand_label)
+
+gghistogram(
+  data  = reads_2000,
+  x     = "aln_start",
+  fill  = "strand_label",
+  color = "transparent",
+  bins  = 100
+) +
+  scale_fill_manual(values = c("+" = "#F44336", "-" = "#2196F3")) +
+  facet_wrap(~ barcode, ncol = 3) +
+  labs(title = "Start Positions Distribution at ~2000 bp",
+       x = "Alignment Start", y = "Count", fill = "Strand") +
+  theme_publication(base_size = 10)
+
+ggsave(file.path(output_dir, "Startpoints2000bp.svg"),
+       width = 180, height = 120, units = "mm")
+```
+
+---
+
+

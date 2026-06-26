@@ -1,0 +1,353 @@
+---
+title: "04 Coverage and InDel Analysis"
+author: "Joyce Suppacher"
+date: "`2026-06-14"
+---
+
+# Coverage and Indel Analysis
+
+This script visualizes coverage and InDel profiles across the vector genome
+for all six rAAV2 cassettes, as well as a separate detailed analysis of the
+wt-fragments cassette.
+
+Approach:
+- Coverage is calculated from filtered BAM files (primary alignments only)
+- Insertions, deletions, Soft-clip 5' and Soft-clip 3' are extracted from CIGAR strings
+- InDel counts are normalized to total read count per sample to allow
+  comparison across samples with different sequencing depths
+- PolyA homopolymer regions (≥5 consecutive adenines) are excluded from
+  InDel analysis to avoid sequencing artifacts
+
+Run `00_setup.Rmd` first.
+
+```{r packages, message=FALSE, warning=FALSE}
+library(GenomicAlignments) # readGAlignments(), coverage(), cigar(), start(), strand()
+library(GenomicRanges)     # GRanges(), IRanges()
+library(Biostrings)        # readDNAStringSet()
+library(dplyr)             # mutate(), filter(), group_by(), summarise(), bind_rows()
+library(purrr)             # map2()
+library(ggplot2)           # ggplot(), geom_line(), scale_color_manual(), ggsave()
+```
+
+Outputs:
+- `Coverage_plot.svg`: Coverage + InDel plot for all six variants
+- `Coverage_wt-fragments.svg`: Detailed coverage + InDel plot for wt-fragments
+
+---
+
+## 1. Load Filtered BAM Files and Reference Sequences
+
+```{r load_data}
+# Load filtered BAM files
+filtered_files <- list.files(
+  bam_dir,
+  pattern    = "\\.bam$",
+  full.names = TRUE,
+  recursive  = TRUE
+)
+
+names(filtered_files) <- basename(filtered_files) %>%
+  gsub("filtered_supp_unm_sec_", "", .) %>%
+  gsub("\\.bam$", "", .)
+
+# Enforce sample order
+filtered_files <- filtered_files[sample_levels]
+
+# Load reference FASTA files for PolyA detection
+fasta_files_ref <- list.files(
+  ref_dir,
+  pattern    = "\\.fasta$|\\.fa$",
+  full.names = TRUE
+)
+
+fasta_names_ref <- basename(fasta_files_ref) %>%
+  gsub("\\.fasta$|\\.fa$", "", .) %>%
+  gsub("transgene_cassette_", "", .)
+```
+
+---
+
+## 2. Detect PolyA Homopolymer Regions
+
+PolyA regions (≥5 consecutive adenines) are identified in each reference
+sequence and excluded from InDel analysis to avoid sequencing artifacts.
+
+```{r polya}
+polyA_list <- map2(fasta_files_ref, fasta_names_ref, function(fasta_file, sample_name) {
+  ref      <- readDNAStringSet(fasta_file)
+  polyA_df <- lapply(names(ref), function(seq_name) {
+    seq     <- ref[[seq_name]]
+    matches <- gregexpr("A{5,}", as.character(seq))[[1]]
+    if (matches[1] == -1) return(NULL)
+    data.frame(
+      seqname = seq_name,
+      start   = as.integer(matches),
+      end     = as.integer(matches) + attr(matches, "match.length") - 1
+    )
+  }) %>% bind_rows()
+
+  GRanges(
+    seqnames = polyA_df$seqname,
+    ranges   = IRanges(start = polyA_df$start, end = polyA_df$end)
+  )
+})
+names(polyA_list) <- fasta_names_ref
+
+
+global_xmax <- max(unlist(lapply(names(filtered_files), function(s) {
+  bam <- readGAlignments(filtered_files[[s]])
+  max(as.integer(end(bam)), na.rm = TRUE)
+})))
+```
+
+---
+
+## 3. Coverage and Indel Extraction Function
+
+Extracts per-position coverage, deletions, insertions, Soft-clip 5' and 3'
+from a GAlignments object. InDels are normalized to total read count.
+
+```{r extract_function}
+extract_cov_indels <- function(bam_file, sample_name, polyA_gr = NULL) {
+
+  bam         <- bam_file
+  vektor_name <- names(seqlengths(bam))[1]
+  num_seqs    <- length(bam)   # total read count for normalization
+
+ # Coverage
+  cov_vec <- as.numeric(coverage(bam)[[vektor_name]])
+  coverage_df <- data.frame(
+    sample = sample_name,
+    pos    = seq_along(cov_vec),
+    count  = cov_vec,
+    type   = "coverage",
+    strand = "+"
+  )
+
+  # PolyA positions
+  polyA_positions <- integer()
+  if (!is.null(polyA_gr)) {
+    polyA_positions <- unlist(
+      lapply(seq_along(polyA_gr), function(i) start(polyA_gr[i]):end(polyA_gr[i]))
+    )
+  }
+
+  # Extract InDels and Soft-clips from CIGAR strings
+  cigars  <- cigar(bam)
+  starts  <- start(bam)
+  strands <- as.character(strand(bam))
+  res     <- vector("list", length(cigars))
+
+  for (i in seq_along(cigars)) {
+    cig        <- cigars[i]
+    ref_pos    <- starts[i]
+    strand_i   <- strands[i]
+    lengths    <- as.numeric(unlist(regmatches(cig, gregexpr("[0-9]+", cig))))
+    ops        <- unlist(regmatches(cig, gregexpr("[A-Z]", cig)))
+    pos_vec    <- c()
+    type_vec   <- c()
+    strand_vec <- c()
+
+    for (j in seq_along(ops)) {
+      op  <- ops[j]
+      len <- lengths[j]
+
+      if (op == "D") {
+        # Deletion: spans multiple reference positions
+        pos_vec    <- c(pos_vec, ref_pos:(ref_pos + len - 1))
+        type_vec   <- c(type_vec, rep("del", len))
+        strand_vec <- c(strand_vec, rep(strand_i, len))
+        ref_pos    <- ref_pos + len
+
+      } else if (op == "I") {
+        # Insertion: single reference position
+        pos_vec    <- c(pos_vec, ref_pos)
+        type_vec   <- c(type_vec, "ins")
+        strand_vec <- c(strand_vec, strand_i)
+
+      } else if (op == "S") {
+        # SoftClip: first S = 5', last S = 3'
+        clip_type  <- if (j == 1) "SoftClip_5" else "SoftClip_3"
+        pos_vec    <- c(pos_vec, ref_pos)
+        type_vec   <- c(type_vec, clip_type)
+        strand_vec <- c(strand_vec, strand_i)
+
+      } else if (op %in% c("M", "=", "X")) {
+        ref_pos <- ref_pos + len
+      }
+    }
+
+    if (length(pos_vec) > 0) {
+      res[[i]] <- data.frame(pos = pos_vec, type = type_vec, strand = strand_vec)
+    }
+  }
+
+  indel_df <- bind_rows(res)
+
+  # Exclude PolyA positions
+  if (length(polyA_positions) > 0) {
+    indel_df <- indel_df %>% filter(!pos %in% polyA_positions)
+  }
+
+ 
+  indel_counts <- indel_df %>%
+    group_by(pos, type, strand) %>%
+    summarise(count = n(), .groups = "drop") %>%
+    mutate(
+      sample = sample_name,
+      count  = ifelse(strand == "-", -(count / num_seqs), count / num_seqs)
+    )
+
+  bind_rows(coverage_df, indel_counts)
+}
+```
+
+---
+
+## 4. Run Extraction for All Samples
+
+```{r extract_all}
+cov_all <- lapply(names(filtered_files), function(sample_name) {
+  bam      <- readGAlignments(filtered_files[[sample_name]])
+  polyA_gr <- if (sample_name %in% names(polyA_list)) polyA_list[[sample_name]] else NULL
+  extract_cov_indels(bam, sample_name, polyA_gr)
+}) %>%
+  bind_rows() %>%
+  mutate(sample = factor(sample, levels = sample_levels))
+```
+
+---
+
+## 5. Coverage + Indel Plot – All Samples
+
+Secondary y-axis shows normalized InDel/Soft-clip signal.
+
+
+```{r coverage_plot_all}
+max_coverage   <- max(cov_all %>% filter(type == "coverage") %>% pull(count), na.rm = TRUE)
+primary_breaks <- seq(0, max_coverage, by = 50000)
+scale_factor   <- 50000 / 0.1   # aligns coverage and indel axes
+
+p_all <- ggplot(cov_all, aes(x = pos, color = type)) +
+  geom_line(
+    data      = cov_all %>% filter(type == "coverage"),
+    aes(y     = count),
+    linewidth = 1
+  ) +
+  geom_line(
+    data      = cov_all %>% filter(type != "coverage"),
+    aes(y     = count * scale_factor, linetype = strand),
+    linewidth = 0.2,
+    alpha     = 0.8
+  ) +
+  geom_hline(yintercept = 0, linewidth = 0.3, color = "grey50") +
+  scale_color_manual(
+    name   = "Signal",
+    values = c(
+      "coverage"   = "black",
+      "del"        = "red",
+      "ins"        = "blue",
+      "SoftClip_5" = "green",
+      "SoftClip_3" = "darkgreen"
+    )
+  ) +
+  scale_linetype_manual(
+    name  = "Strand",
+    values = c("+" = "solid", "-" = "solid"),
+    guide = "none"
+  ) +
+  scale_y_continuous(
+    name     = "Coverage",
+    breaks   = primary_breaks,
+    limits   = c(-max_coverage * 0.1, max_coverage),
+    sec.axis = sec_axis(
+      ~ . / scale_factor,
+      name   = "Relative InDels",
+      breaks = primary_breaks / scale_factor
+    )
+  ) +
+  scale_x_continuous(
+    limits = c(0, global_xmax),
+    expand = expansion(mult = c(0, 0.02))
+  ) +
+  facet_wrap(~ sample, ncol = 3) +
+  labs(x = "Position (bp)") +
+  theme_publication(base_size = 10) +
+  theme(legend.position = "right")
+
+p_all
+
+ggsave(file.path(output_dir, "Coverage_plot.svg"), plot = p_all,
+       width = 180, height = 120, units = "mm")
+```
+
+---
+
+## 6. Coverage + Indel Plot (wt-fragments)
+
+Separate detailed analysis of the wt-fragments sample.
+
+```{r coverage_wtf}
+
+cov_wtf <- cov_all %>% filter(sample == "wt-fragments")
+
+max_coverage_wtf   <- max(cov_wtf %>% filter(type == "coverage") %>% pull(count), na.rm = TRUE)
+primary_breaks_wtf <- seq(0, max_coverage_wtf, by = 50000)
+scale_factor_wtf   <- 50000 / 0.1
+
+p_wtf <- ggplot(cov_wtf, aes(x = pos, color = type)) +
+  geom_line(
+    data      = cov_wtf %>% filter(type == "coverage"),
+    aes(y     = count),
+    linewidth = 1
+  ) +
+  geom_line(
+    data      = cov_wtf %>% filter(type != "coverage"),
+    aes(y     = count * scale_factor_wtf, linetype = strand),
+    linewidth = 0.2,
+    alpha     = 0.8
+  ) +
+  geom_hline(yintercept = 0, linewidth = 0.3, color = "grey50") +
+  scale_color_manual(
+    name   = "Signal",
+    values = c(
+      "coverage"   = "black",
+      "del"        = "red",
+      "ins"        = "blue",
+      "SoftClip_5" = "green",
+      "SoftClip_3" = "darkgreen"
+    )
+  ) +
+  scale_linetype_manual(
+    name  = "Strand",
+    values = c("+" = "solid", "-" = "solid"),
+    guide = "none"
+  ) +
+  scale_y_continuous(
+    name     = "Coverage",
+    breaks   = primary_breaks_wtf,
+    limits   = c(-max_coverage_wtf * 0.1, max_coverage_wtf),
+    sec.axis = sec_axis(
+      ~ . / scale_factor_wtf,
+      name   = "Relative InDels",
+      breaks = primary_breaks_wtf / scale_factor_wtf
+    )
+  ) +
+  scale_x_continuous(
+    limits = c(0, global_xmax),
+    expand = expansion(mult = c(0, 0.02))
+  ) +
+  labs(
+    title = "Coverage wt-fragments",
+    x     = "Position (bp)"
+  ) +
+  theme_publication(base_size = 10) +
+  theme(legend.position = "right")
+
+p_wtf
+
+ggsave(file.path(output_dir, "Coverage_wt-fragments.svg"), plot = p_wtf,
+       width = 180, height = 120, units = "mm")
+```
+
+---
